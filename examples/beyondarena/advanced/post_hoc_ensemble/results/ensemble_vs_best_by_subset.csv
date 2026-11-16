@@ -1,0 +1,9 @@
+subset,best_roster_entrant,best_roster_elo,elo_all models,elo_no early-stopped models,elo_TFMs only,elo_best_single_val_selected
+core2k,TA-KUMO-TABULAR (default),1415.1,1433.3,1476.7,1484.1,1375.6
+tiny,TA-KUMO-TABULAR (default),1495.4,1377.4,1476.0,1496.4,1326.6
+small,TA-LIMIX-2 (default),1603.9,1578.7,1660.4,1677.5,1530.8
+medium,TA-KUMO-TABULAR (default),1516.4,1679.7,1660.4,1663.3,1616.0
+large,TA-REALMLP (tuned + ensemble),1259.5,1599.2,1360.3,1321.4,1379.4
+iid,TA-KUMO-TABULAR (default),1547.9,1484.4,1574.4,1600.3,1438.4
+temporal,TA-KUMO-TABULAR (default),1168.4,1403.1,1289.5,1292.6,1274.6
+grouped,TA-REALMLP (tuned + ensemble),1245.6,1398.4,1363.5,1306.4,1317.6
