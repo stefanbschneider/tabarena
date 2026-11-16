@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -95,21 +96,28 @@ def _labels_agree(stored: np.ndarray, new: np.ndarray) -> bool:
     return bool(np.array_equal(stored, new))
 
 
+#: Guards the labels of the store: methods are extracted on several threads and share them.
+_LABELS_LOCK = threading.Lock()
+
+
 def _write_labels(path: Path, y_val: np.ndarray, y_test: np.ndarray) -> bool:
     """Write the task's labels, or compare them with the ones another method wrote.
 
-    Returns whether the labels agree, the check that all methods predicted the same rows.
+    Returns whether the labels agree, the check that all methods predicted the same rows. The
+    existence check, the write and the comparison run under one lock, so that of two methods
+    reaching a task at the same time one writes and the other is compared.
     """
-    if path.exists():
-        with np.load(path) as stored:
-            return _labels_agree(stored["y_val"], np.asarray(y_val)) and _labels_agree(
-                stored["y_test"], np.asarray(y_test)
-            )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.npz")
-    np.savez(tmp, y_val=np.asarray(y_val), y_test=np.asarray(y_test))
-    tmp.replace(path)
-    return True
+    with _LABELS_LOCK:
+        if path.exists():
+            with np.load(path) as stored:
+                return _labels_agree(stored["y_val"], np.asarray(y_val)) and _labels_agree(
+                    stored["y_test"], np.asarray(y_test)
+                )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp.npz")
+        np.savez(tmp, y_val=np.asarray(y_val), y_test=np.asarray(y_test))
+        tmp.replace(path)
+        return True
 
 
 def extract_method(
@@ -138,7 +146,6 @@ def extract_method(
     }
     wanted_datasets = {dataset for dataset, _ in wanted}
     pending = set(wanted)
-    label_mismatches: list[tuple[str, int]] = []
     dataset_tasks: dict[str, dict] = {}
     spool = Path(tempfile.mkdtemp(prefix=f"slim-{name}-", dir=root))
 
@@ -155,7 +162,11 @@ def extract_method(
         val = _slice_predictions(task_dir / "pred-val.dat", task.metadata["pred_val_shape"], dtype, rows)
         test = _slice_predictions(task_dir / "pred-test.dat", task.metadata["pred_test_shape"], dtype, rows)
         if not _write_labels(root / "labels" / dataset / f"{fold}.npz", task.labels_val, task.labels_test):
-            label_mismatches.append((dataset, fold))
+            # Predictions for other rows than the stored labels must never reach the store.
+            raise ValueError(
+                f"{name}: labels of {dataset} split {fold} differ from the ones another method stored. "
+                "The methods did not predict the same rows on this task."
+            )
         path = out_dir / dataset / f"{fold}.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp.npz")
@@ -205,14 +216,13 @@ def extract_method(
     finally:
         shutil.rmtree(spool, ignore_errors=True)
 
-    summary = {
-        "method": name,
-        "n_tasks": len(wanted) - len(pending),
-        "n_missing": len(pending),
-        "missing": sorted(pending)[:20],
-        "label_mismatches": label_mismatches,
-    }
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if pending:
+        # No completion marker: the next run extracts this method again instead of keeping a reduced pool.
+        raise RuntimeError(
+            f"{name}: {len(pending)} of {len(wanted)} requested tasks are not in its processed.zip, "
+            f"e.g. {sorted(pending)[:5]}."
+        )
+    summary = {"method": name, "n_tasks": len(wanted)}
     (out_dir / "_summary.json").write_text(json.dumps(summary, indent=1))
     return summary
 

@@ -156,6 +156,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True, help="Slim store written by run_extract_predictions.py.")
     parser.add_argument("--output", type=Path, required=True, help="Directory for the result tables.")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--reuse", action="store_true", help="Reuse the per-split tables in --output.")
     args = parser.parse_args()
     root, output = args.root.expanduser(), args.output.expanduser()
     output.mkdir(parents=True, exist_ok=True)
@@ -181,20 +182,23 @@ def main() -> None:
         pools[f"cross, size of {family}"] = flagships[: len(methods)]
     pd.Series(pools).apply(", ".join).rename("methods").to_csv(output / "pools.csv", index_label="pool")
 
-    groups = [(root, d, f, g.reset_index(drop=True), pools) for (d, f), g in members.groupby(["dataset", "fold"])]
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        outputs = list(executor.map(run_task, *zip(*groups, strict=True), chunksize=4))
-    singles = pd.DataFrame([r for o in outputs for r in o["singles"]])
-    pairs = pd.DataFrame([r for o in outputs for r in o["pairs"]])
-    ensembles = pd.DataFrame([r for o in outputs for r in o["ensembles"]])
-    singles.to_parquet(output / "singles_per_split.parquet")
-    pairs.to_parquet(output / "pairs_per_split.parquet")
-    ensembles.to_parquet(output / "ensembles_per_split.parquet")
+    if args.reuse:
+        singles = pd.read_parquet(output / "singles_per_split.parquet")
+        pairs = pd.read_parquet(output / "pairs_per_split.parquet")
+        ensembles = pd.read_parquet(output / "ensembles_per_split.parquet")
+    else:
+        groups = [(root, d, f, g.reset_index(drop=True), pools) for (d, f), g in members.groupby(["dataset", "fold"])]
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            outputs = list(executor.map(run_task, *zip(*groups, strict=True), chunksize=4))
+        singles = pd.DataFrame([r for o in outputs for r in o["singles"]])
+        pairs = pd.DataFrame([r for o in outputs for r in o["pairs"]])
+        ensembles = pd.DataFrame([r for o in outputs for r in o["ensembles"]])
+        singles.to_parquet(output / "singles_per_split.parquet")
+        pairs.to_parquet(output / "pairs_per_split.parquet")
+        ensembles.to_parquet(output / "ensembles_per_split.parquet")
 
     single = per_dataset(singles, "error", ["method"]).pivot(index="dataset", columns="method", values="error")
-    single_val = per_dataset(singles, "error_val", ["method"]).pivot(
-        index="dataset", columns="method", values="error_val"
-    )
+    per_dataset(singles, "error_val", ["method"]).pivot(index="dataset", columns="method", values="error_val")
     ens = per_dataset(ensembles, "error", ["pool", "ensembler"]).pivot(
         index="dataset", columns=["pool", "ensembler"], values="error"
     )
@@ -240,20 +244,23 @@ def main() -> None:
     q2a["gain_difference_wilcoxon_p_holm"] = holm(q2a["gain_difference_wilcoxon_p"])
     q2a.to_csv(output / "q2a_within_vs_cross_family_pools.csv", index=False)
 
-    # -- Question 2b: all pairs of TFMs. Anchor = the member with the lower validation error ----------
+    # -- Question 2b: all pairs of TFMs. Anchor = the member with the lower validation error on the task --
     keys = ["a", "b", "ensembler"]
-    pair = per_dataset(pairs, "error", keys).merge(per_dataset(pairs, "residual_corr", keys), on=[*keys, "dataset"])
-    lookup, lookup_val = single.stack().rename("e"), single_val.stack().rename("e")
+    task = ["dataset", "fold"]
+    split = pairs.copy()
     for side in ("a", "b"):
-        idx = pd.MultiIndex.from_frame(pair[["dataset", side]])
-        pair[f"error_{side}"] = lookup.reindex(idx).to_numpy()
-        pair[f"val_{side}"] = lookup_val.reindex(idx).to_numpy()
-    a_is_anchor = pair["val_a"] <= pair["val_b"]
-    pair["error_anchor"] = np.where(a_is_anchor, pair["error_a"], pair["error_b"])
-    val_anchor = np.where(a_is_anchor, pair["val_a"], pair["val_b"])
-    val_partner = np.where(a_is_anchor, pair["val_b"], pair["val_a"])
+        side_scores = singles.rename(columns={"method": side, "error": f"error_{side}", "error_val": f"val_{side}"})
+        split = split.merge(side_scores, on=[*task, side])
+    # The anchor and the gap are set per split, then errors and gaps are averaged over a dataset's splits.
+    a_is_anchor = split["val_a"] <= split["val_b"]
+    split["error_anchor"] = np.where(a_is_anchor, split["error_a"], split["error_b"])
+    val_anchor = np.where(a_is_anchor, split["val_a"], split["val_b"])
+    val_partner = np.where(a_is_anchor, split["val_b"], split["val_a"])
     # How much weaker the added model is, on validation: 0 = as strong as the anchor.
-    pair["partner_gap"] = ((val_partner - val_anchor) / np.clip(val_anchor, 1e-12, None)).clip(0, 1)
+    split["partner_gap"] = ((val_partner - val_anchor) / np.clip(val_anchor, 1e-12, None)).clip(0, 1)
+    pair = split.groupby([*keys, "dataset"], as_index=False)[
+        ["error", "error_anchor", "partner_gap", "residual_corr"]
+    ].mean()
     pair["gain"] = relative_improvement(pair["error_anchor"], pair["error"])
     pair["same_family"] = pair["a"].map(FAMILY_OF) == pair["b"].map(FAMILY_OF)
     pair.to_parquet(output / "pairs_per_dataset.parquet")

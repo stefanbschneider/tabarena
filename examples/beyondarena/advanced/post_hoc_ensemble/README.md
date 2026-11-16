@@ -96,10 +96,13 @@ the small hosted results tables before any prediction is read.
 Three checks run on the way:
 
 - Labels. The first method to reach a task writes its validation and test labels, every later
-  method is compared against them. They agree on all 2,000 tasks. The older artifacts stored
-  regression targets as CSV text, which differs from the binary ones by float round-off (largest
-  relative difference 3.5e-16), so floats are compared with a tolerance.
+  method is compared against them, and the extraction stops on a difference. They agree on all
+  2,000 tasks. The older artifacts stored regression targets as CSV text, which differs from the
+  binary ones by float round-off (largest relative difference 3.5e-16), so floats are compared with
+  a tolerance.
 - Coverage. Every method has predictions for every task it has results for (`member_coverage.csv`).
+  The extraction of a method fails, and is repeated on the next run, when a requested task is not
+  in its artifact.
 - Rescoring. Each kept config is rescored from the stored predictions and compared with the hosted
   error (`stored_prediction_check.csv`). For 19 of the 26 methods every task agrees within 0.1% on
   validation. The exceptions are small: TabPFN-3 differs on test by more than 0.1% on 3.8% of its
@@ -291,16 +294,16 @@ the best single model of its own pool, picked per task on validation:
 The difference points the same way in all four families and is small. Only Kumo reaches
 significance, barely.
 
-All 153 pairs. For each pair of TFMs the gain is measured over the pair's stronger member (lower
-validation error on the task), for the equal-weight average and for fitted weights. A regression of
+All 153 pairs. For each pair of TFMs the gain is measured over the pair's stronger member, picked
+per split by its validation error, for the equal-weight average and for fitted weights. A regression of
 the pair's mean gain on how much weaker the added model is (on validation) and on whether the pair
 is from different families gives the family effect at equal strength. Intervals come from
 resampling datasets, which keeps the dependence between pairs that share a model.
 
 | Ensembler | Family effect at equal partner strength | 95% interval | p |
 | --- | --- | --- | --- |
-| equal-weight average | -0.19 points | -0.68 to 0.23 | 0.49 |
-| weights fitted on validation | -0.11 points | -0.32 to 0.08 | 0.33 |
+| equal-weight average | -0.02 points | -0.46 to 0.38 | 0.91 |
+| weights fitted on validation | +0.05 points | -0.06 to 0.17 | 0.31 |
 
 ![TFM pairs](figures/tfm_pairs.png)
 
@@ -309,9 +312,10 @@ partner's strength: every 10 points of validation gap cost about 3 points of err
 same-family pairs are slightly more correlated (0.965 against 0.947), in line with a small
 diversity advantage of different families, but all TFMs make very similar errors.
 
-A second finding of this view: two TFMs are rarely enough. Only 29% of the pairs with fitted
-weights and 8% of the equal-weight pairs beat their stronger member on average. The gain in
-question 1 comes from letting GES pick among many candidates.
+A second finding of this view: a second TFM helps a little when its weight is fitted, and hurts
+when it is not. With fitted weights 88% of the pairs beat their stronger member on average, by 0.4%
+(different families) and 0.5% (same family). Of the equal-weight pairs 18% do. The 2% of question 1
+needs GES over many candidates.
 
 ### Question 3: one large checkpoint or two small ones from different families
 
@@ -342,8 +346,8 @@ Limits:
   one checkpoint, which would be even less diverse.
 - Family is confounded with strength (Kumo's members are all strong, TabDPT's are weak). The
   analyses adjust for strength on validation, with a linear term in the pair view.
-- Four families and 15 same-family pairs give little power for a small effect. The intervals above
-  exclude a family effect larger than about 1 point of error.
+- Four families and 15 same-family pairs give little power for a small effect. The intervals of
+  the pair view exclude a family effect larger than about half a point of error.
 - Tasks above 100k training rows are excluded, since eight TFMs did not run them.
 
 ### A follow-up that settles the within-TFM question with little compute
