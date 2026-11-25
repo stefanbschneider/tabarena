@@ -1,26 +1,39 @@
-"""Unfinished (stopped by the API quota, see README.md). Fit single-member TabPFN-3.5 ensembles through the hosted API, one seed per config.
+"""TabPFN-3.5 at several ensemble sizes through the hosted API, on split 0 of the tiny and small datasets.
 
-Each config runs TabPFN-3.5 with ``n_estimators=1`` and its own ``random_state`` on split 0 of the
-tiny and small BeyondArena datasets (up to 10k training rows, no text columns), with the same
-inner folds and preprocessing as the stored run. Averaging the first ``k`` seeds then simulates a
-``k``-member TabPFN-3.5 ensemble (see ``run_within_vs_across_tfm.py``). One more config runs the
-API default (8 members, seed 0) on the first 10 datasets, as a check against the stored
-TA-TabPFN-3.5 predictions.
+The hosted API charges a flat amount per predict call (10,000 tokens, whatever the table size or the
+number of members) and a key gets 5M tokens a month. So the ensemble size is set directly with
+``n_estimators``, and only the final model's test predictions are requested: one call per dataset
+and size. The 8-member predictions are the stored TA-TabPFN-3.5 ones.
 
-    TABPFN_TOKEN=... python -P examples/beyondarena/advanced/post_hoc_ensemble/run_tabpfn_members.py \
-        --expname ~/tabpfn_members --root ~/beyond_slim
+Datasets: split 0 of the BeyondArena datasets with at most 10k training rows and no text columns
+(84 datasets). Commands, in order:
 
-``run`` fits (restartable: finished configs are cached under ``--expname``), ``collect`` writes the
-predictions into the slim store as methods ``TA-TabPFN-3.5-API-n1-s<seed>`` and ``-n8-s0``.
+``capture``
+    Runs the TabArena pipeline once per dataset with ``TabPFN35CaptureModel`` (no API calls) and
+    stores the final model's preprocessed training and test tables: the same splits, preprocessing
+    and categorical columns as the stored run.
+``estimate``
+    Prices every planned call with the API's free cost estimate and stops when the total exceeds
+    ``--budget``.
+``run``
+    Fits and predicts each dataset at every size in ``SIZES`` (plus 8 members on the first
+    ``N_CHECK_DATASETS`` datasets, a check against the stored predictions) and writes the test
+    predictions into the slim store as ``TA-TabPFN-3.5-API-n<k>``. Restartable; stops at once when
+    the monthly quota is reached.
+
+    python -P examples/beyondarena/advanced/post_hoc_ensemble/run_tabpfn_members.py capture \
+        --capture ~/tabpfn_capture --root ~/beyond_slim
+    TABPFN_TOKEN=... python -P examples/beyondarena/advanced/post_hoc_ensemble/run_tabpfn_members.py run \
+        --capture ~/tabpfn_capture --root ~/beyond_slim
 """
 
 from __future__ import annotations
 
 import argparse
-import gzip
-import pickle
-import subprocess
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -28,19 +41,16 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))  # `python -P` leaves the script directory off the path
 from slim_predictions import _labels_agree
+from tabpfn_api_model import MODEL_PATH, call_with_retry
 
-AG_NAME = "TA-TabPFN-3.5-API"
-#: Datasets on which the 8-member API default also runs, as a check against the stored predictions.
+API = "TA-TabPFN-3.5-API"
+#: Ensemble sizes requested from the API; 8 members (the default) are stored. 32 members would cost
+#: about twice the flat rate per call and does not fit in one month's quota.
+SIZES = [1, 2, 4, 16]
+#: Datasets on which 8 members are also requested, as a check against the stored predictions.
 N_CHECK_DATASETS = 10
-
-
-def configs(n_seeds: int) -> list[dict]:
-    """The check config first, then one single-member config per seed."""
-    return [{"n_estimators": 8}, *({"n_estimators": 1, "random_state": seed} for seed in range(n_seeds))]
-
-
-def config_label(config: dict) -> str:
-    return f"n{config['n_estimators']}-s{config.get('random_state', 0)}"
+#: Tokens per predict call, as the API's cost estimate reports them.
+TOKENS_PER_CALL = 10_000
 
 
 def datasets() -> list[str]:
@@ -51,106 +61,148 @@ def datasets() -> list[str]:
     return sorted(tasks.loc[keep, "dataset"])
 
 
-def run_shard(expname: str, dataset_names: list[str], n_seeds: int) -> None:
-    from tabpfn_api_model import config_generator
+def planned_calls(names: list[str]) -> list[tuple[str, int]]:
+    """``(dataset, n_estimators)`` pairs, dataset by dataset so that a short quota leaves whole datasets."""
+    check = set(names[:N_CHECK_DATASETS])
+    return [(d, k) for d in names for k in (sorted([*SIZES, 8]) if d in check else SIZES)]
+
+
+# -- capture ---------------------------------------------------------------------------------------
+
+
+def capture(capture_dir: Path, root: Path) -> None:
+    from tabpfn_api_model import TabPFN35CaptureModel
 
     from tabarena.benchmark.experiment import BeyondArenaExperimentBundle
     from tabarena.benchmark.task.metadata.collection import TaskSubset
     from tabarena.contexts import BeyondArenaContext
+    from tabarena.utils.config_utils import ConfigGenerator
 
-    experiments = BeyondArenaExperimentBundle(models=[(config_generator(configs(n_seeds)), 0)]).build_experiments()
-    check_datasets = set(datasets()[:N_CHECK_DATASETS])
+    generator = ConfigGenerator(search_space={}, model_cls=TabPFN35CaptureModel, manual_configs=[{}])
+    experiments = BeyondArenaExperimentBundle(models=[(generator, 0)]).build_experiments()
     context = BeyondArenaContext(backend="native")
-    for dataset in dataset_names:
-        # The 8-member check config runs on a few datasets only; the API allows 60 fits per minute.
-        dataset_experiments = experiments if dataset in check_datasets else experiments[1:]
-        # One dataset at a time, so that a failing dataset does not stop the shard.
-        try:
-            context.build_and_run_jobs(
-                dataset_experiments,
-                expname=expname,
-                task_subset=TaskSubset(subset=["core2k", "lite"], dataset_names=[dataset]),
-                register=False,
-                debug_mode=True,
-            )
-        except Exception as e:
-            print(f"FAILED {dataset}: {type(e).__name__}: {e}", flush=True)
+    for dataset in datasets():
+        out = capture_dir / dataset
+        if (out / "X_test.parquet").exists():
+            continue
+        for stale in out.glob("*"):
+            stale.unlink()
+        os.environ["TABPFN_CAPTURE_DIR"] = str(out)
+        context.build_and_run_jobs(
+            experiments,
+            expname=None,  # a throwaway results directory: only the captured tables are kept
+            task_subset=TaskSubset(subset=["core2k", "lite"], dataset_names=[dataset]),
+            register=False,
+            debug_mode=True,
+        )
+        finish_capture(out, root / "labels" / dataset / "0.npz")
+        print(f"captured {dataset}", flush=True)
 
 
-def collect(expname: Path, root: Path, n_seeds: int) -> pd.DataFrame:
-    """Copy the predictions into the slim store, checking labels against the stored ones."""
-    rows = []
-    for i, config in enumerate(configs(n_seeds)):
-        method = f"{AG_NAME}-{config_label(config)}"
-        for path in sorted((expname / "data" / f"{AG_NAME}_c{i + 1}_BAG_L1").glob("*/0_0/results.pkl")):
-            with gzip.open(path, "rb") as f:
-                result = pickle.load(f)
-            dataset, artifacts = path.parts[-3], result["simulation_artifacts"]
-            name = f"{AG_NAME}_c{i + 1}_BAG_L1"
-            with np.load(root / "labels" / dataset / "0.npz") as labels:
-                if not (
-                    _labels_agree(labels["y_val"], artifacts["y_val"])
-                    and _labels_agree(labels["y_test"], artifacts["y_test"])
-                ):
-                    raise ValueError(f"{method}: labels of {dataset} differ from the stored ones")
-            out = root / "preds" / method / dataset / "0.npz"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(
-                out,
-                models=np.array([method]),
-                val=artifacts["pred_proba_dict_val"][name][None].astype(np.float32),
-                test=artifacts["pred_proba_dict_test"][name][None].astype(np.float32),
-            )
-            rows.append(
-                {
-                    "method": method,
-                    "dataset": dataset,
-                    "fold": 0,
-                    "n_estimators": config["n_estimators"],
-                    "seed": config.get("random_state", 0),
-                    "metric": result["metric"],
-                    "problem_type": result["problem_type"],
-                    "metric_error": float(result["metric_error"]),
-                    "metric_error_val": float(result["metric_error_val"]),
-                    "time_train_s": float(result["time_train_s"]),
-                    "time_infer_s": float(result["time_infer_s"]),
-                }
-            )
-    table = pd.DataFrame(rows)
-    table.to_parquet(root / "tabpfn_api_members.parquet")
-    return table
+def finish_capture(out: Path, labels_path: Path) -> None:
+    """Pick the test table among the refit model's predict calls and check it against the stored labels."""
+    with np.load(labels_path) as labels:
+        y_val, y_test = labels["y_val"], labels["y_test"]
+    y_train = np.load(out / "y_train.npy", allow_pickle=False)
+    # The stored validation labels are the out-of-fold labels of all training rows, in training order.
+    if not _labels_agree(y_val, y_train):
+        raise ValueError(f"{out.name}: the captured training labels differ from the stored ones")
+    candidates = [p for p in sorted(out.glob("X_predict_*.parquet")) if len(pd.read_parquet(p)) == len(y_test)]
+    if not candidates:
+        raise ValueError(f"{out.name}: no predict call of the refit model has the test size {len(y_test)}")
+    # The test prediction is the last call of that size (an earlier one would be a throughput probe).
+    candidates[-1].rename(out / "X_test.parquet")
+    for path in out.glob("X_predict_*.parquet"):
+        path.unlink()
+
+
+# -- API -------------------------------------------------------------------------------------------
+
+
+def _client_estimator(problem_type: str, n_estimators: int, categorical: list[int] | None):
+    from tabpfn_client import TabPFNClassifier, TabPFNRegressor
+
+    model_cls = TabPFNRegressor if problem_type == "regression" else TabPFNClassifier
+    return model_cls(
+        model_path=MODEL_PATH,
+        n_estimators=n_estimators,
+        random_state=0,
+        categorical_features_indices=categorical,
+        ignore_pretraining_limits=True,
+    )
+
+
+def estimate(capture_dir: Path, budget: int) -> int:
+    from tabpfn_client.cost import estimate_cost
+
+    total = 0
+    for dataset, k in planned_calls(datasets()):
+        X_train = pd.read_parquet(capture_dir / dataset / "X_train.parquet")
+        X_test = pd.read_parquet(capture_dir / dataset / "X_test.parquet")
+        cost = estimate_cost(
+            np.zeros(X_train.shape), np.zeros(X_test.shape), model_version=MODEL_PATH.split("_")[0], n_estimators=k
+        )
+        total += int(cost.estimated_cost)
+    print(f"{len(planned_calls(datasets()))} calls, {total:,} tokens estimated, budget {budget:,}")
+    if total > budget:
+        raise SystemExit("The planned calls exceed the budget.")
+    return total
+
+
+def predict_test(capture_dir: Path, dataset: str, n_estimators: int) -> np.ndarray:
+    """Test predictions in the stored format: positive-class probability (binary), one column
+    per class in label order (multiclass), or the prediction (regression).
+    """
+    out = capture_dir / dataset
+    meta = json.loads((out / "meta.json").read_text())
+    X_train, X_test = pd.read_parquet(out / "X_train.parquet"), pd.read_parquet(out / "X_test.parquet")
+    y_train = np.load(out / "y_train.npy")
+    model = _client_estimator(meta["problem_type"], n_estimators, meta["categorical_features_indices"])
+    call_with_retry(model.fit, X_train, y_train)
+    if meta["problem_type"] == "regression":
+        return np.asarray(call_with_retry(model.predict, X_test), dtype=np.float32)
+    proba = np.asarray(call_with_retry(model.predict_proba, X_test), dtype=np.float32)
+    n_classes = int(y_train.max()) + 1
+    full = np.zeros((len(X_test), max(n_classes, 2)), dtype=np.float32)
+    full[:, np.asarray(model.classes_, dtype=int)] = proba
+    return full[:, 1] if meta["problem_type"] == "binary" else full
+
+
+def run(capture_dir: Path, root: Path) -> None:
+    calls = planned_calls(datasets())
+    done = 0
+    for dataset, k in calls:
+        path = root / "preds" / f"{API}-n{k}" / dataset / "0.npz"
+        if path.exists():
+            done += 1
+            continue
+        start = time.time()
+        test = predict_test(capture_dir, dataset, k)
+        with np.load(root / "labels" / dataset / "0.npz") as labels:
+            if len(test) != len(labels["y_test"]):
+                raise ValueError(f"{dataset}: {len(test)} test predictions for {len(labels['y_test'])} labels")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # No validation predictions in this design; `val` holds an empty placeholder.
+        np.savez(path, models=np.array([f"{API}-n{k}"]), val=np.zeros((1, 0), np.float32), test=test[None])
+        done += 1
+        print(f"[{done}/{len(calls)}] {dataset} n_estimators={k} ({time.time() - start:.0f}s)", flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["run", "collect"])
-    parser.add_argument("--expname", type=Path, required=True, help="Directory of the raw results.")
-    parser.add_argument("--root", type=Path, required=True, help="Slim store to add the predictions to.")
-    parser.add_argument("--seeds", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=6, help="Processes calling the API at the same time.")
-    parser.add_argument("--shard", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("command", choices=["capture", "estimate", "run"])
+    parser.add_argument("--capture", type=Path, required=True, help="Directory of the captured tables.")
+    parser.add_argument("--root", type=Path, required=True, help="Slim store (labels, predictions).")
+    parser.add_argument("--budget", type=int, default=4_800_000, help="Token budget for `estimate`.")
     args = parser.parse_args()
-    expname, root = args.expname.expanduser(), args.root.expanduser()
-
-    if args.command == "collect":
-        table = collect(expname, root, args.seeds)
-        print(table.groupby("method").size().to_string())
-        return
-    if args.shard is not None:
-        run_shard(str(expname), args.shard.split(","), args.seeds)
-        return
-    names = datasets()
-    print(f"{len(names)} datasets, {args.seeds + 1} configs each, {args.workers} workers")
-    shards = [names[i :: args.workers] for i in range(args.workers)]
-    expname.mkdir(parents=True, exist_ok=True)
-    procs = []
-    for i, shard in enumerate(shards):
-        cmd = [sys.executable, "-P", __file__, "run", "--expname", str(expname), "--root", str(root)]
-        cmd += ["--seeds", str(args.seeds), "--shard", ",".join(shard)]
-        log = open(expname / f"worker_{i}.log", "w")  # noqa: SIM115
-        procs.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))  # noqa: S603
-    for proc in procs:
-        proc.wait()
+    capture_dir, root = args.capture.expanduser(), args.root.expanduser()
+    if args.command == "capture":
+        capture(capture_dir, root)
+    elif args.command == "estimate":
+        estimate(capture_dir, args.budget)
+    else:
+        estimate(capture_dir, args.budget)
+        run(capture_dir, root)
 
 
 if __name__ == "__main__":

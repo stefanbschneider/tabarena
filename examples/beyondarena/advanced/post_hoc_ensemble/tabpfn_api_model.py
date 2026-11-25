@@ -38,6 +38,8 @@ def call_with_retry(fn, *args, **kwargs) -> Any:
             return fn(*args, **kwargs)
         except Exception as e:
             message = str(e)
+            if "usage limit" in message.lower():
+                raise  # the monthly quota: waiting does not help
             transient = "429" in message or re.search(r"HTTP 5\d\d", message) or "inaccessible" in message
             if not transient or attempt == MAX_ATTEMPTS - 1:
                 raise
@@ -114,3 +116,58 @@ class TabPFN35APIModel(AbstractModel):
 def config_generator(configs: list[dict]) -> ConfigGenerator:
     """One config per entry of ``configs`` (e.g. ``{"n_estimators": 1, "random_state": 3}``)."""
     return ConfigGenerator(search_space={}, model_cls=TabPFN35APIModel, manual_configs=configs)
+
+
+class TabPFN35CaptureModel(TabPFN35APIModel):
+    """Records the preprocessed tables of the final (refit) model instead of calling the API.
+
+    Run through the TabArena pipeline, it writes the training table, its labels and every table the
+    refit model is asked to predict, after exactly the preprocessing ``TabPFN35APIModel`` applies,
+    to the directory in the ``TABPFN_CAPTURE_DIR`` environment variable. The fold models, whose
+    validation predictions the captured design does not use, predict the training prior.
+    """
+
+    ag_key = "TA-TABPFN-3.5-CAPTURE"
+    ag_name = "TA-TabPFN-3.5-Capture"
+
+    _is_refit: bool = False
+    _prior = None
+
+    def _fit(self, X: pd.DataFrame, y: pd.Series, X_val: pd.DataFrame | None = None, **kwargs) -> None:
+        import json
+        import os
+        from pathlib import Path
+
+        import numpy as np
+
+        X = self.preprocess(X, y=y, is_train=True)
+        self._is_refit = X_val is None
+        if self.problem_type == "regression":
+            self._prior = float(np.mean(y))
+        else:
+            counts = np.bincount(np.asarray(y, dtype=int), minlength=self.num_classes or int(np.max(y)) + 1)
+            self._prior = counts / counts.sum()
+        if not self._is_refit:
+            return
+        out = Path(os.environ["TABPFN_CAPTURE_DIR"])
+        out.mkdir(parents=True, exist_ok=True)
+        X.to_parquet(out / "X_train.parquet")
+        np.save(out / "y_train.npy", np.asarray(y))
+        meta = {"problem_type": self.problem_type, "categorical_features_indices": self._categorical_indices}
+        (out / "meta.json").write_text(json.dumps(meta))
+
+    def _predict_proba(self, X: pd.DataFrame, **kwargs):
+        import os
+        from pathlib import Path
+
+        import numpy as np
+
+        X = self.preprocess(X, **kwargs)
+        if self._is_refit:
+            out = Path(os.environ["TABPFN_CAPTURE_DIR"])
+            index = len(list(out.glob("X_predict_*.parquet")))
+            X.to_parquet(out / f"X_predict_{index}.parquet")
+        if self.problem_type == "regression":
+            return np.full(len(X), self._prior)
+        proba = np.tile(self._prior, (len(X), 1))
+        return self._convert_proba_to_unified_form(proba)

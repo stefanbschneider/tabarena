@@ -376,27 +376,34 @@ predictions in future BeyondArena runs would make the comparison free.
 | `run_build_ensemble.py` | step 2: ensembles, checks, leaderboards |
 | `run_tfm_ensembling_study.py` | step 3 |
 | `run_make_figures.py` | figures |
-| `tabpfn_api_model.py`, `run_tabpfn_members.py`, `run_within_vs_across_tfm.py` | unfinished: the equal-budget follow-up through the hosted TabPFN API (see below) |
+| `tabpfn_api_model.py`, `run_tabpfn_members.py`, `run_within_vs_across_tfm.py` | step 5, pending: the equal-budget follow-up through the hosted TabPFN API (see below) |
 | `results/`, `figures/` | committed outputs |
 
-## Unfinished: the equal-budget follow-up
+## Pending: the equal-budget follow-up
 
-`tabpfn_api_model.py` runs TabPFN-3.5 through the hosted Prior Labs API inside the TabArena
-pipeline, so that its predictions use the same splits, inner folds and preprocessing as the stored
-run. On the splits where it ran, the API's default (8 members) reproduces the stored test
-predictions (largest absolute difference 0.0006 on blood_transfusion, under 0.04 on 9 more datasets)
-and the labels match exactly.
+This step answers whether ensembling within a TFM or across TFMs is better at equal compute, which
+the stored predictions cannot (they hold each TFM's internal ensemble only after averaging). It
+uses the hosted Prior Labs API, whose TabPFN-3.5 takes the ensemble size as `n_estimators`.
 
-`run_tabpfn_members.py` and `run_within_vs_across_tfm.py` were meant to fit 16 single-member seeds
-on split 0 of the 84 tiny and small datasets without text columns, and compare 16 members of
-TabPFN-3.5 with 8 members plus another TFM. The run stopped on the API's monthly quota after 19
-configs: each predict call costs a flat 10,000 tokens and a key gets 5M per month, while this design
-needs about 27,000 calls (one per inner fold and seed). No results of this step are reported.
+- `tabpfn_api_model.py`: TabPFN-3.5 through the API as a TabArena model. Run inside the pipeline,
+  it reproduces the stored predictions: the labels match exactly, and the test predictions differ
+  by at most 0.0006 on blood_transfusion and 0.04 on 9 more datasets. `TabPFN35CaptureModel`
+  records the final model's preprocessed tables instead of calling the API.
+- `run_tabpfn_members.py`: `capture` stores those tables for split 0 of the 84 tiny and small
+  datasets without text columns (no API calls), `estimate` prices the planned calls with the API's
+  free estimate, `run` requests the test predictions of TabPFN-3.5 at 1, 2, 4 and 16 members
+  (8 members are stored; they are also requested on 10 datasets as a check).
+- `run_within_vs_across_tfm.py`: the error against ensemble size, and 16 members against 8 members
+  plus a TFM of another family, all equal-weight averages, paired per dataset. The partner's predict time relative to 8 TabPFN-3.5 members is reported per row.
 
-A design that fits in one month's quota sets `n_estimators` directly (1, 2, 4, 16 and 32 members,
-the 8-member predictions being stored) and calls the API only for the final model's test
-predictions: about 420 calls. It supports equal-weight comparisons only, since it produces no
-validation predictions.
+Cost: a predict call costs 10,000 tokens up to 16 members (about 22,000 at 32) and a key gets 5M
+tokens a month, so the design makes one call per dataset and size: 346 calls, 3.6M tokens by the
+API's estimate. A first attempt that ran every inner fold
+(about 27,000 calls) used up the November quota; the run is scheduled for December 1, when the
+quota resets. Results will be added here.
+
+Equal-weight averages only: this design requests no validation predictions, so weights fitted on
+validation are not part of it.
 
 ## Not done
 
