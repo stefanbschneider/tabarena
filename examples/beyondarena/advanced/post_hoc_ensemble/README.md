@@ -376,7 +376,27 @@ predictions in future BeyondArena runs would make the comparison free.
 | `run_build_ensemble.py` | step 2: ensembles, checks, leaderboards |
 | `run_tfm_ensembling_study.py` | step 3 |
 | `run_make_figures.py` | figures |
+| `tabpfn_api_model.py`, `run_tabpfn_members.py`, `run_within_vs_across_tfm.py` | unfinished: the equal-budget follow-up through the hosted TabPFN API (see below) |
 | `results/`, `figures/` | committed outputs |
+
+## Unfinished: the equal-budget follow-up
+
+`tabpfn_api_model.py` runs TabPFN-3.5 through the hosted Prior Labs API inside the TabArena
+pipeline, so that its predictions use the same splits, inner folds and preprocessing as the stored
+run. On the splits where it ran, the API's default (8 members) reproduces the stored test
+predictions (largest absolute difference 0.0006 on blood_transfusion, under 0.04 on 9 more datasets)
+and the labels match exactly.
+
+`run_tabpfn_members.py` and `run_within_vs_across_tfm.py` were meant to fit 16 single-member seeds
+on split 0 of the 84 tiny and small datasets without text columns, and compare 16 members of
+TabPFN-3.5 with 8 members plus another TFM. The run stopped on the API's monthly quota after 19
+configs: each predict call costs a flat 10,000 tokens and a key gets 5M per month, while this design
+needs about 27,000 calls (one per inner fold and seed). No results of this step are reported.
+
+A design that fits in one month's quota sets `n_estimators` directly (1, 2, 4, 16 and 32 members,
+the 8-member predictions being stored) and calls the API only for the final model's test
+predictions: about 420 calls. It supports equal-weight comparisons only, since it produces no
+validation predictions.
 
 ## Not done
 
