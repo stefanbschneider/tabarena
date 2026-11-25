@@ -1,0 +1,11 @@
+pool,methods
+all TFMs,"TA-TabDPT, TA-TabPFN-2.6, TA-TabICLv2, TA-TabPFN-3, TA-TabPFN-3.5, TA-TabPFN-3.5-Fast, Causilo, TA-LimiX-2-1016, TA-TabFM, TA-EXAONE-Tabular, TA-RealTabPFN-v2.5, TA-TabDPT-1.3, TA-TabSwift, TA-Kumo-Tabular, TA-Kumo-Tabular-Medium, TA-Kumo-Tabular-Small, TA-Seldon, TA-Seldon-Mini"
+one per family,"TA-Kumo-Tabular, TA-LimiX-2-1016, TA-Seldon, TA-TabPFN-3.5, TA-TabFM, Causilo, TA-EXAONE-Tabular, TA-TabICLv2, TA-TabDPT-1.3, TA-TabSwift"
+within TabPFN,"TA-TabPFN-2.6, TA-RealTabPFN-v2.5, TA-TabPFN-3, TA-TabPFN-3.5, TA-TabPFN-3.5-Fast"
+"cross, size of TabPFN","TA-Kumo-Tabular, TA-LimiX-2-1016, TA-Seldon, TA-TabPFN-3.5, TA-TabFM"
+within Kumo,"TA-Kumo-Tabular, TA-Kumo-Tabular-Medium, TA-Kumo-Tabular-Small"
+"cross, size of Kumo","TA-Kumo-Tabular, TA-LimiX-2-1016, TA-Seldon"
+within Seldon,"TA-Seldon, TA-Seldon-Mini"
+"cross, size of Seldon","TA-Kumo-Tabular, TA-LimiX-2-1016"
+within TabDPT,"TA-TabDPT, TA-TabDPT-1.3"
+"cross, size of TabDPT","TA-Kumo-Tabular, TA-LimiX-2-1016"

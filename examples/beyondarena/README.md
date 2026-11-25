@@ -77,6 +77,9 @@ The `advanced/` folder holds lower-level and specialized workflows:
 - `advanced/run_quickstart_beyondarena_custom_datasets.py` — Benchmark on your **own** dataset:
   load a [Data Foundry](#about-data-foundry) container, convert it to a TabArena `UserTask`, and
   evaluate models on it (no BeyondArena baselines, leaderboard computed purely from your results).
+- [`advanced/post_hoc_ensemble/`](advanced/post_hoc_ensemble/README.md): a walkthrough that builds a
+  cross-model ensemble over the BeyondArena roster from the hosted predictions (the counterpart of
+  the TabArena ensemble, nothing is trained) and studies ensembling across tabular foundation models.
 
 ## 🔎 Choosing what to run: subsets
 
